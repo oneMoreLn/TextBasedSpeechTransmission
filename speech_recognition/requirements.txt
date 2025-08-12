@@ -1,0 +1,8 @@
+# Core STT pipeline
+speechrecognition>=3.10.0
+faster-whisper>=1.0.0
+webrtcvad>=2.0.10
+numpy>=1.22
+soundfile>=0.12.1
+# Microphone backend used by speech_recognition
+pyaudio>=0.2.14
