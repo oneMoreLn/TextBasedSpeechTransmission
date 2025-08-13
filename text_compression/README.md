@@ -1,6 +1,6 @@
 # Text Streaming Compression & Transmission
 
-This module implements a streaming text compression and transport pipeline using LZ4 (py-lz4framed) over sockets.
+This module implements a streaming text compression and transport pipeline using LZ4 (py-lz4framed) and Zstandard over sockets, with optional channel error injection.
 
 Pipeline
 - Encoder (sender):
@@ -16,13 +16,21 @@ Pipeline
   4. Print and log reconstructed text.
 
 Notes
-- Tokenizer: a simple reversible integer mapping (UTF-8 bytes → varint list), robust to arbitrary Unicode.
-- Framing: network uses a minimal 4-byte big-endian length header per LZ4-compressed payload.
-- Logs: JSONL under `log/` capturing tx/rx events.
+- Tokenizer: a simple reversible integer mapping (UTF-8 bytes → varint list), robust to arbitrary Unicode. Default pack-mode is raw UTF-8.
+- Framing: network uses a minimal 4-byte big-endian length header per payload (raw/LZ4/Zstd auto-sniffed on receiver).
+- Logs: JSONL under `log/` capturing tx/rx events. Sender/receiver also log network throughput (tx-net/rx-net) and summaries.
+- Channel error injection: you can flip random bits in the encoded payload to test robustness.
 
 Quick start
 - Start receiver:
-  - python text_compression/src/receiver.py --host 127.0.0.1 --port 9500 --log-dir log
-- Start sender:
-  - python text_compression/src/sender.py --host 127.0.0.1 --port 9500 --input-file test.txt --log-dir log
+  - conda run -n sptrans python text_compression/src/receiver.py --host 127.0.0.1 --port 9523 --log-dir log --expect auto
+- Start sender (ASR→sender example):
+  - conda run -n sptrans python text_compression/src/asr_to_sender.py --host 127.0.0.1 --port 9523 --source audio --audio-file test.wav --model medium --device cpu --print-asr --log-dir log --pack-mode raw --codec zstd --compress-threshold 256 --batch-ms 150 --batch-bytes 2048 --bitflip-prob 0.001 --bitflip-seed 42
+
+Bit flip injection
+- Both sender paths support bit flip injection after compression and before framing.
+- Flags:
+  - --bitflip-prob: per-bit flip probability (default 0.001). Set 0 to disable.
+  - --bitflip-seed: RNG seed for reproducibility (optional).
+- Logs include bitflip_prob, bitflips (total flipped bits), and bitflip_bytes (bytes affected) per batch.
 

@@ -12,7 +12,7 @@ import base64
 # Allow importing sibling modules when run as a script
 sys.path.insert(0, os.path.dirname(__file__))
 
-from codec import tokenize, pack_tokens, lz4_compress, frame, zstd_compress
+from codec import tokenize, pack_tokens, lz4_compress, frame, zstd_compress, rs_fec_encode
 from common import prepare_log_path
 
 
@@ -68,6 +68,11 @@ def main():
     ap.add_argument("--pack-mode", choices=["varint", "raw"], default="raw", help="Payload packing: varint tokens or raw UTF-8")
     ap.add_argument("--codec", choices=["raw", "lz4", "zstd"], default="zstd", help="Compression codec when payload >= threshold")
     ap.add_argument("--compress-threshold", type=int, default=256, help="Min payload bytes to apply compression; below sends raw")
+    # FEC (Reed-Solomon) optional parity symbols
+    ap.add_argument("--fec-nsym", type=int, default=0, help="FEC parity symbols (Reed-Solomon). 0 to disable.")
+    # channel error injection
+    ap.add_argument("--bitflip-prob", type=float, default=0.001, help="Per-bit flip probability injected after encoding (0 disables)")
+    ap.add_argument("--bitflip-seed", type=int, default=None, help="Random seed for bit flipping (optional)")
     # zstd options
     ap.add_argument("--zstd-level", type=int, default=3)
     ap.add_argument("--zstd-dict", default="", help="Path to zstd dictionary file (optional)")
@@ -77,6 +82,10 @@ def main():
     args = ap.parse_args()
 
     log_path = prepare_log_path(args.log_file, args.log_dir, prefix="tx")
+
+    # RNG for bit flipping
+    import random
+    rng = random.Random(args.bitflip_seed)
 
     text_q: "queue.Queue[Optional[str]]" = queue.Queue()
     send_q: "queue.Queue" = queue.Queue(maxsize=64)
@@ -146,6 +155,25 @@ def main():
                 codec_used = "raw"
             compressed = codec_used != "raw"
         t4 = _t.perf_counter()
+        # Inject random bit flips on the encoded bytes (after compression, before framing)
+        bitflips = 0
+        flipped_bytes = 0
+        if args.bitflip_prob and args.bitflip_prob > 0.0 and len(comp) > 0:
+            ba = bytearray(comp)
+            for i in range(len(ba)):
+                mask = 0
+                for b in range(8):
+                    if rng.random() < args.bitflip_prob:
+                        mask |= (1 << b)
+                if mask:
+                    ba[i] ^= mask
+                    flipped_bytes += 1
+                    # count set bits in mask (Hamming weight)
+                    bitflips += (mask & 1) + ((mask >> 1) & 1) + ((mask >> 2) & 1) + ((mask >> 3) & 1) + ((mask >> 4) & 1) + ((mask >> 5) & 1) + ((mask >> 6) & 1) + ((mask >> 7) & 1)
+            comp = bytes(ba)
+        # Apply optional FEC (adds parity; increases size; can correct limited errors)
+        if args.fec_nsym and args.fec_nsym > 0 and len(comp) > 0:
+            comp = rs_fec_encode(comp, args.fec_nsym)
         framed = frame(comp)
         t5 = _t.perf_counter()
 
@@ -183,6 +211,10 @@ def main():
                 "codec": codec_used,
                 "zstd_level": args.zstd_level,
                 "zstd_dict": bool(zstd_dict_bytes),
+                "fec_nsym": args.fec_nsym,
+                "bitflip_prob": args.bitflip_prob,
+                "bitflips": bitflips,
+                "bitflip_bytes": flipped_bytes,
             }
         }
 

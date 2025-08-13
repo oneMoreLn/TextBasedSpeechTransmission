@@ -6,6 +6,10 @@ from typing import Iterable, Iterator, List, Tuple, Optional
 
 import lz4framed
 import zstandard as zstd
+try:
+    from reedsolo import RSCodec  # type: ignore
+except Exception:
+    RSCodec = None  # optional dependency
 
 # Minimal varint encode/decode (base-128) for non-negative ints
 
@@ -133,6 +137,7 @@ HDR_STRUCT = struct.Struct(">I")
 
 
 def frame(payload: bytes) -> bytes:
+    # 4-byte big-endian length prefix
     return HDR_STRUCT.pack(len(payload)) + payload
 
 
@@ -167,3 +172,28 @@ __all__ = [
     "frame",
     "deframe",
 ]
+
+# Optional FEC (Reed-Solomon) helpers
+def rs_fec_encode(data: bytes, nsym: int) -> bytes:
+    if nsym <= 0 or RSCodec is None:
+        return data
+    rs = RSCodec(nsym)
+    try:
+        return rs.encode(data)
+    except Exception:
+        return data
+
+
+def rs_fec_decode(data: bytes, nsym: int) -> Tuple[bytes, bool]:
+    if nsym <= 0 or RSCodec is None:
+        return data, False
+    rs = RSCodec(nsym)
+    try:
+        out = rs.decode(data)
+        # some versions return bytes, some return (bytes, ecc)
+        if isinstance(out, tuple):
+            return out[0], True
+        return out, True  # type: ignore
+    except Exception:
+        return data, False
+

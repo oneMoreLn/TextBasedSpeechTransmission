@@ -12,7 +12,7 @@ import base64
 # Allow importing sibling modules when run as a script
 sys.path.insert(0, os.path.dirname(__file__))
 
-from codec import detokenize, unpack_tokens, lz4_decompress, deframe, frame, is_lz4_frame, is_zstd_frame, zstd_decompress
+from codec import detokenize, unpack_tokens, lz4_decompress, deframe, frame, is_lz4_frame, is_zstd_frame, zstd_decompress, rs_fec_decode
 from common import prepare_log_path
 
 
@@ -63,6 +63,7 @@ def main():
     ap.add_argument("--log-dir", default="log")
     ap.add_argument("--expect", choices=["auto", "lz4", "zstd", "raw"], default="auto", help="How to interpret payload")
     ap.add_argument("--zstd-dict", default="", help="Path to zstd dictionary file (optional)")
+    ap.add_argument("--fec-nsym", type=int, default=0, help="FEC parity symbols used by sender (Reed-Solomon). 0 to disable.")
     args = ap.parse_args()
 
     log_path = prepare_log_path(args.log_file, args.log_dir, prefix="rx")
@@ -106,6 +107,10 @@ def main():
                 import time as _t
                 rx_t0 = _t.perf_counter()
                 r0 = _t.perf_counter()
+                # Optional FEC decode first
+                fec_ok = None
+                if args.fec_nsym and args.fec_nsym > 0 and len(payload) > 0:
+                    payload, fec_ok = rs_fec_decode(payload, args.fec_nsym)
                 # Decide whether to decompress
                 used_lz4 = False
                 if args.expect == "lz4" or (args.expect == "auto" and is_lz4_frame(payload)):
@@ -117,20 +122,30 @@ def main():
                 else:
                     dec = payload
                 r1 = _t.perf_counter()
-                # Try varint-unpack first; if fails, fallback to raw utf-8
+                # Try varint-unpack first; if fails, fallback to UTF-8 (strict→replace)
                 tokens = []
                 text = None
+                decode_mode = None
+                decode_repl = 0
+                def _utf8_best_effort(b: bytes):
+                    try:
+                        s = b.decode("utf-8", errors="strict")
+                        return s, "strict", 0
+                    except UnicodeDecodeError:
+                        s = b.decode("utf-8", errors="replace")
+                        return s, "replace", s.count("\ufffd")
                 try:
                     tokens = unpack_tokens(dec)
                     r2 = _t.perf_counter()
                     if len(tokens) == 0 and len(dec) > 0:
-                        # Likely not a varint-packed payload; treat as raw UTF-8
-                        text = dec.decode("utf-8", errors="strict")
+                        # Likely not a varint-packed payload; treat as UTF-8 with best-effort fallback
+                        text, decode_mode, decode_repl = _utf8_best_effort(dec)
                     else:
                         text = detokenize(tokens)
+                        decode_mode, decode_repl = "tokens", 0
                 except Exception:
                     r2 = _t.perf_counter()
-                    text = dec.decode("utf-8", errors="strict")
+                    text, decode_mode, decode_repl = _utf8_best_effort(dec)
                 r3 = _t.perf_counter()
 
                 dec_ms = (r1 - r0) * 1000.0
@@ -166,8 +181,14 @@ def main():
                                 "total": total_ms,
                             },
                             "used_lz4": used_lz4,
+                            "fec_nsym": args.fec_nsym,
+                            "fec_ok": fec_ok,
                             "expect": args.expect,
                             "text": text,
+                            "decode": {
+                                "mode": decode_mode,
+                                "replacements": decode_repl,
+                            },
                         }, ensure_ascii=False) + "\n")
                 # RX throughput log (instantaneous and rolling)
                 if log_path:
