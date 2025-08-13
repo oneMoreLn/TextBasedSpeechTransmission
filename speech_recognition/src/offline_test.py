@@ -120,6 +120,14 @@ def main():
     parser.add_argument("--beam-size", type=int, default=5)
     parser.add_argument("--sample-rate", type=int, default=16000)
     parser.add_argument("--frame-ms", type=int, default=20, choices=[10, 20, 30])
+    # VAD tuning (use same defaults as streaming)
+    parser.add_argument("--vad-aggr", type=int, default=2, choices=[0,1,2,3], help="WebRTC VAD aggressiveness")
+    parser.add_argument("--max-silence-ms", type=int, default=800)
+    parser.add_argument("--min-speech-ms", type=int, default=200)
+    parser.add_argument("--max-chunk-ms", type=int, default=2000)
+    parser.add_argument("--energy-threshold", type=float, default=0.008)
+    parser.add_argument("--energy-or", action="store_true", help="Treat speech if VAD OR energy gate fires")
+    parser.add_argument("--no-vad", action="store_true", help="Bypass VAD and send the whole file as one chunk")
     parser.add_argument("--print-queue", action="store_true")
     parser.add_argument("--log-file", default="", help="Append JSON lines with {chunk_id, text, rtf, e2e_s, dur_s, proc_s, model, device, ts}")
     parser.add_argument("--log-dir", default="log", help="Directory to save logs when --log-file is empty (filename auto-generated)")
@@ -202,8 +210,49 @@ def main():
     # Convert to PCM16 bytes
     pcm = float32_to_pcm16(data)
 
+    # Fast path: optional no-VAD mode for platforms where WebRTC-VAD suppresses everything
+    if args.no_vad:
+        import itertools
+        _cid = itertools.count(1)
+        try:
+            cid = next(_cid)
+            dur_s = len(pcm) / (2 * args.sample_rate)
+            audio_q: "queue.Queue[Any]" = cast("queue.Queue[Any]", audio_chunks)
+            audio_q.put({"pcm": pcm, "id": cid, "t0": time.monotonic(), "dur_s": dur_s, "sr": args.sample_rate}, timeout=1.0)
+            try:
+                TranscriptQueue.put({"type": "info", "message": f"Queued 1 chunk (no-vad), ~{dur_s:.2f}s audio; waiting for transcription..."})
+            except Exception:
+                pass
+        except queue.Full:
+            TranscriptQueue.put({"type": "info", "message": "Dropping full-file chunk due to backlog (offline)"})
+        # Wait similar to below and then shutdown
+        total_audio_s = float(len(data)) / float(args.sample_rate)
+        dev = args.device if args.device != "auto" else "cpu"
+        cpu_slow_factor = 4.0 if dev == "cpu" else 2.0
+        model_boost = 1.5 if str(args.model).lower().startswith(("medium", "large")) else 1.0
+        wait_secs = max(5.0, min(300.0, total_audio_s * cpu_slow_factor * model_boost))
+        deadline = time.time() + wait_secs
+        while time.time() < deadline:
+            try:
+                empty = cast("queue.Queue[Any]", audio_chunks).empty()
+            except Exception:
+                empty = True
+            if empty:
+                break
+            time.sleep(0.2)
+        time.sleep(1.0)
+        if printer_thread is not None:
+            stop.set()
+            printer_thread.join(timeout=1.0)
+        worker.stop()
+        worker.join(timeout=3.0)
+        return
+
     # Feed through VAD into audio_chunks
-    vad = VADStreamer(sample_rate=args.sample_rate, frame_ms=args.frame_ms)
+    vad = VADStreamer(sample_rate=args.sample_rate, frame_ms=args.frame_ms,
+                      vad_aggressiveness=args.vad_aggr, max_silence_ms=args.max_silence_ms,
+                      min_speech_ms=args.min_speech_ms, max_chunk_ms=args.max_chunk_ms,
+                      energy_threshold=args.energy_threshold, energy_or=args.energy_or)
     frame_bytes = int(args.sample_rate * args.frame_ms / 1000) * 2
 
     import itertools
@@ -237,6 +286,19 @@ def main():
             queued_dur += dur_s
         except queue.Full:
             TranscriptQueue.put({"type": "info", "message": "Dropping tail due to backlog (offline)"})
+
+    # If VAD yielded nothing, fallback to sending the whole file once
+    if queued_chunks == 0:
+        try:
+            cid = next(_cid)
+            dur_s = len(pcm) / (2 * args.sample_rate)
+            audio_q: "queue.Queue[Any]" = cast("queue.Queue[Any]", audio_chunks)
+            audio_q.put({"pcm": pcm, "id": cid, "t0": time.monotonic(), "dur_s": dur_s, "sr": args.sample_rate}, timeout=1.0)
+            queued_chunks = 1
+            queued_dur = dur_s
+            TranscriptQueue.put({"type": "info", "message": "VAD produced 0 chunks; fallback to whole-file chunk"})
+        except queue.Full:
+            TranscriptQueue.put({"type": "info", "message": "Dropping full-file fallback chunk due to backlog (offline)"})
 
     # Notify how much work was queued (helps when model loading is slow)
     try:

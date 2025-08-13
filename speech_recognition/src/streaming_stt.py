@@ -57,7 +57,7 @@ def float32_to_pcm16(arr: np.ndarray) -> bytes:
 class VADStreamer:
     def __init__(self, sample_rate: int = 16000, frame_ms: int = 20, vad_aggressiveness: int = 2,
                  max_silence_ms: int = 800, min_speech_ms: int = 200, max_chunk_ms: int = 2000,
-                 energy_threshold: float = 0.008):
+                 energy_threshold: float = 0.008, energy_or: bool = False):
         self.sample_rate = sample_rate
         self.frame_ms = frame_ms
         self.vad = webrtcvad.Vad(vad_aggressiveness)
@@ -65,11 +65,14 @@ class VADStreamer:
         self.min_speech_ms = min_speech_ms
         self.max_chunk_ms = max_chunk_ms
         self.energy_threshold = energy_threshold
+        # When True, treat a frame as speech if either WebRTC-VAD OR energy gate says speech.
+        # Default False keeps original behavior (energy used only on exception)
+        self.use_energy_or = energy_or
 
         self.frame_bytes = int(sample_rate * frame_ms / 1000) * 2  # 16-bit mono
-        self.frames: Deque[bytes] = collections.deque()
+        self.frames = collections.deque()
         self.in_speech = False
-        self.speech_frames: Deque[bytes] = collections.deque()
+        self.speech_frames = collections.deque()
         self.speech_ms = 0
         self.silence_ms = 0
 
@@ -86,6 +89,11 @@ class VADStreamer:
             is_speech = self.vad.is_speech(frame, self.sample_rate)
         except Exception:
             is_speech = self._is_speech_energy(frame)
+
+        # Optional OR-gating with energy to avoid over-suppression on some platforms/files
+        if (not is_speech) and self.use_energy_or:
+            if self._is_speech_energy(frame):
+                is_speech = True
 
         if is_speech:
             if not self.in_speech:
