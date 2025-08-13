@@ -2,9 +2,10 @@ import io
 import json
 import os
 import struct
-from typing import Iterable, Iterator, List, Tuple
+from typing import Iterable, Iterator, List, Tuple, Optional
 
 import lz4framed
+import zstandard as zstd
 
 # Minimal varint encode/decode (base-128) for non-negative ints
 
@@ -89,6 +90,43 @@ def lz4_decompress(data: bytes) -> bytes:
     return lz4framed.decompress(data)
 
 
+# LZ4 frame magic (little-endian): 0x04 0x22 0x4D 0x18
+LZ4F_MAGIC = b"\x04\x22\x4D\x18"
+
+
+def is_lz4_frame(data: bytes) -> bool:
+    """Return True if data looks like an LZ4 Frame (by magic number)."""
+    return len(data) >= 4 and data[:4] == LZ4F_MAGIC
+
+
+# Zstd helpers (optionally with dictionary)
+
+def zstd_compress(data: bytes, level: int = 3, dict_bytes: Optional[bytes] = None) -> bytes:
+    if dict_bytes is not None and len(dict_bytes) > 0:
+        d = zstd.ZstdCompressionDict(dict_bytes)
+        cctx = zstd.ZstdCompressor(level=level, dict_data=d)
+    else:
+        cctx = zstd.ZstdCompressor(level=level)
+    return cctx.compress(data)
+
+
+def zstd_decompress(data: bytes, dict_bytes: Optional[bytes] = None) -> bytes:
+    if dict_bytes is not None and len(dict_bytes) > 0:
+        d = zstd.ZstdCompressionDict(dict_bytes)
+        dctx = zstd.ZstdDecompressor(dict_data=d)
+    else:
+        dctx = zstd.ZstdDecompressor()
+    return dctx.decompress(data)
+
+
+# Zstd frame magic
+ZSTD_MAGIC = b"\x28\xB5\x2F\xFD"
+
+
+def is_zstd_frame(data: bytes) -> bool:
+    return len(data) >= 4 and data[:4] == ZSTD_MAGIC
+
+
 # Network framing: 4-byte big-endian length prefix per LZ4 frame payload
 
 HDR_STRUCT = struct.Struct(">I")
@@ -122,6 +160,10 @@ __all__ = [
     "unpack_tokens",
     "lz4_compress",
     "lz4_decompress",
+    "is_lz4_frame",
+    "is_zstd_frame",
+    "zstd_compress",
+    "zstd_decompress",
     "frame",
     "deframe",
 ]

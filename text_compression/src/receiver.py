@@ -7,11 +7,12 @@ import time
 from typing import Optional
 import os
 import sys
+import base64
 
 # Allow importing sibling modules when run as a script
 sys.path.insert(0, os.path.dirname(__file__))
 
-from codec import detokenize, unpack_tokens, lz4_decompress, deframe
+from codec import detokenize, unpack_tokens, lz4_decompress, deframe, frame, is_lz4_frame, is_zstd_frame, zstd_decompress
 from common import prepare_log_path
 
 
@@ -20,22 +21,38 @@ def recv_worker(host: str, port: int, out_q: "queue.Queue[bytes]", stop: threadi
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((host, port))
     srv.listen(1)
+    srv.settimeout(1.0)
     try:
         print(f"[receiver] Listening on {host}:{port} ...")
-        conn, addr = srv.accept()
-        print(f"[receiver] Accepted connection from {addr}")
-        with conn:
-            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            buf = bytearray()
-            while not stop.is_set():
-                data = conn.recv(8192)
-                if not data:
-                    break
-                buf.extend(data)
-                for payload in deframe(buf):
-                    out_q.put(payload)
+        while not stop.is_set():
+            try:
+                conn, addr = srv.accept()
+            except socket.timeout:
+                continue
+            print(f"[receiver] Accepted connection from {addr}")
+            with conn:
+                try:
+                    conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                except Exception:
+                    pass
+                conn.settimeout(1.0)
+                buf = bytearray()
+                while not stop.is_set():
+                    try:
+                        data = conn.recv(8192)
+                    except socket.timeout:
+                        continue
+                    if not data:
+                        print("[receiver] Peer closed. Back to listening...")
+                        break
+                    buf.extend(data)
+                    for payload in deframe(buf):
+                        out_q.put(payload)
     finally:
-        srv.close()
+        try:
+            srv.close()
+        except Exception:
+            pass
 
 
 def main():
@@ -44,6 +61,8 @@ def main():
     ap.add_argument("--port", type=int, default=9500)
     ap.add_argument("--log-file", default="")
     ap.add_argument("--log-dir", default="log")
+    ap.add_argument("--expect", choices=["auto", "lz4", "zstd", "raw"], default="auto", help="How to interpret payload")
+    ap.add_argument("--zstd-dict", default="", help="Path to zstd dictionary file (optional)")
     args = ap.parse_args()
 
     log_path = prepare_log_path(args.log_file, args.log_dir, prefix="rx")
@@ -62,6 +81,18 @@ def main():
     sum_len_payload = 0
     sum_len_dec = 0
     seq = 0
+    # RX throughput accumulators (bits and seconds)
+    avg_rx_bits = 0.0
+    avg_rx_time = 0.0
+
+    # Optional zstd dict
+    zstd_dict_bytes = None
+    if args.zstd_dict:
+        try:
+            with open(args.zstd_dict, "rb") as df:
+                zstd_dict_bytes = df.read()
+        except Exception as e:
+            print(f"[receiver] failed to read zstd dict: {e}")
 
     try:
         while True:
@@ -73,12 +104,33 @@ def main():
                 continue
             try:
                 import time as _t
+                rx_t0 = _t.perf_counter()
                 r0 = _t.perf_counter()
-                dec = lz4_decompress(payload)
+                # Decide whether to decompress
+                used_lz4 = False
+                if args.expect == "lz4" or (args.expect == "auto" and is_lz4_frame(payload)):
+                    dec = lz4_decompress(payload)
+                    used_lz4 = True
+                elif args.expect == "zstd" or (args.expect == "auto" and is_zstd_frame(payload)):
+                    dec = zstd_decompress(payload, dict_bytes=zstd_dict_bytes)
+                    used_lz4 = False
+                else:
+                    dec = payload
                 r1 = _t.perf_counter()
-                tokens = unpack_tokens(dec)
-                r2 = _t.perf_counter()
-                text = detokenize(tokens)
+                # Try varint-unpack first; if fails, fallback to raw utf-8
+                tokens = []
+                text = None
+                try:
+                    tokens = unpack_tokens(dec)
+                    r2 = _t.perf_counter()
+                    if len(tokens) == 0 and len(dec) > 0:
+                        # Likely not a varint-packed payload; treat as raw UTF-8
+                        text = dec.decode("utf-8", errors="strict")
+                    else:
+                        text = detokenize(tokens)
+                except Exception:
+                    r2 = _t.perf_counter()
+                    text = dec.decode("utf-8", errors="strict")
                 r3 = _t.perf_counter()
 
                 dec_ms = (r1 - r0) * 1000.0
@@ -105,14 +157,36 @@ def main():
                             "len_dec": len(dec),
                             "len_payload": len(payload),
                             "cr_payload_vs_dec": (len(payload) / len(dec)) if len(dec) else None,
+                            "payload_b64": base64.b64encode(payload).decode("ascii"),
+                            "framed_b64": base64.b64encode(frame(payload)).decode("ascii"),
                             "dec_ms": {
                                 "decompress": dec_ms,
                                 "unpack": unpack_ms,
                                 "detokenize": detok_ms,
                                 "total": total_ms,
                             },
+                            "used_lz4": used_lz4,
+                            "expect": args.expect,
                             "text": text,
                         }, ensure_ascii=False) + "\n")
+                # RX throughput log (instantaneous and rolling)
+                if log_path:
+                    # instantaneous rx_bps based on this payload size and processing duration
+                    rx_ms = (r3 - rx_t0) * 1000.0
+                    rx_bps = (len(payload) * 8.0) / max(1e-6, (r3 - rx_t0))
+                    # update rolling averages
+                    avg_rx_bits += len(payload) * 8.0
+                    avg_rx_time += (r3 - rx_t0)
+                    with open(log_path, "a", encoding="utf-8") as f:
+                        f.write(json.dumps({
+                            "type": "rx-net",
+                            "ts": time.time(),
+                            "seq": seq,
+                            "bytes": len(payload),
+                            "rx_ms": rx_ms,
+                            "rx_bps": rx_bps,
+                            "avg_rx_bps": (avg_rx_bits / avg_rx_time) if avg_rx_time > 0 else None,
+                        }) + "\n")
             except Exception as e:
                 if log_path:
                     with open(log_path, "a", encoding="utf-8") as f:
@@ -141,6 +215,7 @@ def main():
                             "payload": sum_len_payload,
                             "dec": sum_len_dec,
                         },
+                        "avg_rx_bps": (avg_rx_bits / avg_rx_time) if avg_rx_time > 0 else None,
                     }, ensure_ascii=False) + "\n")
             except Exception:
                 pass
