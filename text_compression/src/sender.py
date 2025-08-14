@@ -59,10 +59,13 @@ def sender_worker(host: str, port: int, send_q: "queue.Queue", stop: threading.E
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Streaming text sender with LZ4 over TCP")
+    ap = argparse.ArgumentParser(description="Streaming text sender with LZ4/Zstd over TCP")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=9500)
-    ap.add_argument("--input-file", required=True)
+    # Back-compat: support both --input-file and legacy --source/--text-file style
+    ap.add_argument("--input-file", default="", help="Text file to read lines from (alias of --text-file)")
+    ap.add_argument("--source", choices=["text-file"], default="text-file", help="Input source type (currently only text-file)")
+    ap.add_argument("--text-file", default="", help="Alias of --input-file")
     ap.add_argument("--log-file", default="")
     ap.add_argument("--log-dir", default="log")
     ap.add_argument("--pack-mode", choices=["varint", "raw"], default="raw", help="Payload packing: varint tokens or raw UTF-8")
@@ -71,7 +74,7 @@ def main():
     # FEC (Reed-Solomon) optional parity symbols
     ap.add_argument("--fec-nsym", type=int, default=0, help="FEC parity symbols (Reed-Solomon). 0 to disable.")
     # channel error injection
-    ap.add_argument("--bitflip-prob", type=float, default=0.001, help="Per-bit flip probability injected after encoding (0 disables)")
+    ap.add_argument("--bitflip-prob", type=float, default=0.0, help="Per-bit flip probability injected after encoding (0 disables)")
     ap.add_argument("--bitflip-seed", type=int, default=None, help="Random seed for bit flipping (optional)")
     # zstd options
     ap.add_argument("--zstd-level", type=int, default=3)
@@ -80,6 +83,14 @@ def main():
     ap.add_argument("--batch-ms", type=int, default=150, help="Batching time window in ms")
     ap.add_argument("--batch-bytes", type=int, default=2048, help="Batching size window in bytes")
     args = ap.parse_args()
+
+    # Resolve input file path with back-compat
+    input_path = args.input_file or args.text_file
+    if args.source != "text-file":
+        print(f"[sender] Unsupported --source {args.source}; only 'text-file' is supported.")
+        sys.exit(2)
+    if not input_path:
+        ap.error("--input-file is required (or use --text-file)")
 
     log_path = prepare_log_path(args.log_file, args.log_dir, prefix="tx")
 
@@ -104,7 +115,7 @@ def main():
     sum_total_ms = 0.0
     seq = 0
 
-    prod_t = threading.Thread(target=producer_lines, args=(args.input_file, text_q), daemon=True)
+    prod_t = threading.Thread(target=producer_lines, args=(input_path, text_q), daemon=True)
     prod_t.start()
 
     stop = threading.Event()

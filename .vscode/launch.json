@@ -1,0 +1,33 @@
+{
+    // 使用 IntelliSense 了解相关属性。 
+    // 悬停以查看现有属性的描述。
+    // 欲了解更多信息，请访问: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+
+        {
+            "name": "receiver",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "text_compression/src/receiver.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--host", "127.0.0.1",
+                "--port", "9500",
+                "--log-dir", "log",
+                "--expect", "auto",
+                "--fec-nsym", "0",
+                "--tts-enable",
+                "--tts-model", "tts_models/zh-CN/baker/tacotron2-DDC-GST",
+                "--tts-speaker", "speaker_id",
+                "--tts-language", "zh-CN",
+                "--tts-trim-silence",
+                "--tts-trim-db", "40",
+                "--tts-gap-ms", "150",
+                "--tts-batch-wait-ms", "200",
+                "--tts-save-chunks",
+                "--tts-chunk-dir", "log/tts_chunks"
+            ]
+        }
+    ]
+}

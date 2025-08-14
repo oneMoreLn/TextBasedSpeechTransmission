@@ -2,3 +2,6 @@ py-lz4framed==0.14.0
 msgpack==1.0.8
 zstandard==0.22.0
 reedsolo==1.7.0
+TTS<0.21
+# Coqui TTS 的可选依赖，在 0.0.5 起使用 PEP 604 union 语法（与 py39 下旧解析器不完全兼容）
+bangla<0.0.5
