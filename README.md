@@ -85,6 +85,71 @@ python text_compression/src/asr_to_sender.py \
   --compress-threshold 256 --batch-ms 150 --batch-bytes 2048
 ```
 
+## voice_process 模块（封装式 API）
+
+`voice_process.py` 提供一个独立于 sender/receiver 的封装式语音处理接口，用于：
+
+- voice_encode：采集端每 250ms 输入一帧 1024 样本（int16），每 5 秒聚合为一周期，运行 ASR，得到文本后 UTF-8 编码并进行 zstd 压缩，按照固定报文长度分包（默认 2088 字节）并转为十六进制字符串输出到 `voice2msg_queue`。
+- voice_decode：接收端从 `msg2voice_queue` 取十六进制字符串数据包，按报文头重组完整消息并去除填充，解压得到文本，调用 TTS 合成为音频，再按 1024 样本分片推送到 `voice_recv_queue`。
+
+### 固定长度报文格式
+
+- 固定长度：`packet_len`（默认 2088 字节）
+- 头部 8 字节：
+  - [0:2] message_id (uint16, big-endian)
+  - [2:4] total_len (uint16): 本消息压缩后总字节数
+  - [4] total_segs (uint8): 当前消息被切成的总段数
+  - [5] seg_idx (uint8): 当前包的段索引（0..total_segs-1）
+  - [6:8] seg_len (uint16): 本包负载实际字节数
+- 负载：`seg_len` 字节
+- 填充：其后全部补 `0x00` 直到 `packet_len`
+- 传输：以 ASCII 十六进制字符串（长度 `packet_len*2`）进行传输；解包时依赖 `seg_len/total_len` 去除填充。
+
+### 关键参数
+
+- packet_len：固定包长度（默认 2088）
+- cycle_seconds：聚合一个 ASR 周期的时长（默认 5.0s）
+- chunk_samples：每帧样本数（默认 1024）
+- chunk_interval_ms：帧间隔（默认 250ms）
+- asr_model_name / asr_device：Faster-Whisper 模型与设备
+- tts_model_name：Coqui TTS 模型（默认 `tts_models/zh-CN/baker/tacotron2-DDC-GST`）
+
+### 最小示例（本地自测，不加载真实模型）
+
+项目提供 `demo_voice_process_debug.py`，通过 DummyASR/DummyTTS 验证分包/重组/合成链路：
+
+```bash
+python demo_voice_process_debug.py
+```
+
+若需集成到你的应用：
+
+```python
+from voice_process import VoiceProcessor
+import numpy as np
+
+vp = VoiceProcessor(packet_len=2088, cycle_seconds=5.0)
+
+# 采集侧：每 250ms 推入一帧 1024 样本的 int16
+vp.voice_encode(np.zeros(1024, dtype=np.int16))
+
+# 取出固定长度十六进制数据包，发往你的传输通道
+hex_packet = vp.voice2msg_queue.get()
+
+# 接收侧：收到十六进制数据包后送入解码
+vp.voice_decode(hex_packet)
+
+# 合成的音频以 1024 样本帧输出
+chunk = vp.voice_recv_queue.get()  # np.ndarray(int16, shape=(1024,))
+```
+
+### 注意事项
+
+- `voice_process` 为轻量封装，压缩默认使用 zstd；在未安装依赖时 Demo 会回退为直通（仅便于测试），正式部署请安装 `text_compression/requirements.txt` 并使用真实压缩。
+- TTS 在 Python 3.9 环境下与版本钉死更稳定（TTS<0.21），如在 Python 3.13 运行 Demo，请仅作为链路验证。
+- 报文头字段需双方严格一致；`message_id` 仅用于重组与去重，未实现重传与乱序修复。
+- `cycle_seconds` 会影响端到端延迟与识别稳定性，按需求权衡。
+
 ## Important notes
 
 - Always run both sender and receiver in the same environment (e.g., `sptrans`).
