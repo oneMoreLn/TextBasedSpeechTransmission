@@ -1,0 +1,20 @@
+# Unified top-level requirements for the whole project
+# Pin Python 3.9 compatible versions where needed
+
+# Transport, compression, packing, FEC, and TTS (receiver side)
+py-lz4framed==0.14.0
+msgpack==1.0.8
+zstandard==0.22.0
+reedsolo==1.7.0
+# Coqui TTS on Python 3.9: keep <0.21 to avoid newer deps with PEP 604 union types
+TTS<0.21
+# bangla <0.0.5 avoids PEP 604 unions on Py39
+bangla<0.0.5
+
+# STT pipeline (sender/asr)
+speechrecognition>=3.10.0
+faster-whisper>=1.0.0
+webrtcvad>=2.0.10
+numpy>=1.22
+soundfile>=0.12.1
+pyaudio>=0.2.14
